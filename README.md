@@ -1,7 +1,8 @@
 # BangCaptcha 🎸
 
 ```bash
-pnpm run dev
+pnpm i
+pnpm dev
 ```
 
 ## API
