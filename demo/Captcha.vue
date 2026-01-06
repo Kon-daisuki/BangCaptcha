@@ -1,18 +1,17 @@
-<script setup lang="ts">
+<script setup>
 import { ref, onMounted } from 'vue';
-import type { CaptchaChallenge, CaptchaVerifyRequest, CaptchaVerifyResponse, TracePoint } from '../types';
 
-const API_BASE = 'http://localhost:3001';
+const API_BASE = 'https://band.kessoku.us.kg';
 
-const challenge = ref<CaptchaChallenge | null>(null);
-const selectedIndexes = ref<number[]>([]);
-const message = ref<string>('');
-const isSuccess = ref<boolean>(false);
-const loading = ref<boolean>(false);
+const challenge = ref(null);
+const selectedIndexes = ref([]);
+const message = ref('');
+const isSuccess = ref(false);
+const loading = ref(false);
 
 // 行为分析数据
-const traceData = ref<TracePoint[]>([]);
-const startTime = ref<number>(0);
+const traceData = ref([]);
+const startTime = ref(0);
 
 const fetchCaptcha = async () => {
   loading.value = true;
@@ -26,7 +25,15 @@ const fetchCaptcha = async () => {
     if (!res.ok) throw new Error('Network response was not ok');
     const data = await res.json();
     challenge.value = data;
-    startTime.value = Date.now(); // 记录开始时间
+    
+    // 修复图片路径（如果 Worker 返回相对路径）
+    if (challenge.value && challenge.value.images) {
+      challenge.value.images = challenge.value.images.map(img => {
+        return img.startsWith('http') ? img : `${API_BASE}${img}`;
+      });
+    }
+
+    startTime.value = Date.now();
   } catch (error) {
     console.error('Failed to fetch captcha:', error);
     message.value = '加载验证码失败';
@@ -35,18 +42,13 @@ const fetchCaptcha = async () => {
   }
 };
 
-const handleMouseMove = (e: MouseEvent) => {
-  // 每 50ms 记录一次，或者简单地每移动一点就记录
-  // 这里为了演示简单，直接记录所有点，生产环境最好抽样
+const handleMouseMove = (e) => {
   if (!challenge.value || isSuccess.value) return;
-  
-  // 限制轨迹数组大小，防止内存溢出
   if (traceData.value.length > 500) return;
-
   traceData.value.push([Date.now(), e.clientX, e.clientY]);
 };
 
-const toggleSelect = (index: number) => {
+const toggleSelect = (index) => {
   if (selectedIndexes.value.includes(index)) {
     selectedIndexes.value = selectedIndexes.value.filter(i => i !== index);
   } else {
@@ -59,31 +61,46 @@ const verifyCaptcha = async () => {
   
   loading.value = true;
   try {
-    const body: CaptchaVerifyRequest = {
+    const body = {
       id: challenge.value.id,
       selectedIndexes: selectedIndexes.value,
       traceData: traceData.value,
       startTime: startTime.value
     };
 
+    // 这里我们先模拟发送给 Worker 验证，或者直接发送给父窗口
+    // 既然我们在 iframe 里，最好的做法是：
+    // 1. 如果 Worker 有 /api/verify 接口，先在这里验证一遍 UI 效果
+    // 2. 验证成功后，再发消息给父窗口
+    
     const res = await fetch(`${API_BASE}/api/verify`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
     
-    const data: CaptchaVerifyResponse = await res.json();
+    const data = await res.json();
     
     if (data.success) {
       isSuccess.value = true;
       const timeSec = data.duration ? (data.duration / 1000).toFixed(2) : '0';
-      message.value = `${data.message} (耗时: ${timeSec}s)`;
+      message.value = `验证通过! (耗时: ${timeSec}s)`;
+      
+      // 🔥 核心修改：告诉父窗口验证成功了，把 ID 和 索引 发过去
+      // 父窗口随后会把这些数据再次发给 /api/register 进行最终校验
+      setTimeout(() => {
+         window.parent.postMessage({
+            type: 'CAPTCHA_RESULT',
+            payload: {
+              captchaId: challenge.value.id,
+              selectedIndexes: selectedIndexes.value
+            }
+         }, '*'); // 上线建议改为具体域名
+      }, 500);
+
     } else {
       isSuccess.value = false;
-      message.value = data.message;
-      // 失败后延迟刷新
+      message.value = data.message || '验证失败';
       setTimeout(() => {
         if (!isSuccess.value) fetchCaptcha();
       }, 1500);
@@ -127,7 +144,7 @@ onMounted(() => {
       
       <div class="actions">
         <button @click="fetchCaptcha" class="refresh-btn">刷新</button>
-        <button @click="verifyCaptcha" class="verify-btn" :disabled="loading">
+        <button @click="verifyCaptcha" class="verify-btn" :disabled="loading || selectedIndexes.length === 0">
           {{ loading ? '验证中...' : '提交' }}
         </button>
       </div>
@@ -139,26 +156,31 @@ onMounted(() => {
   </div>
 </template>
 
-<style scoped>
+<style>
+/* 这里的样式直接放在全局，确保生效 */
+body { margin: 0; padding: 0; background-color: transparent; }
+
 .captcha-container {
   font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
   display: flex;
   justify-content: center;
   align-items: center;
-  min-height: 300px;
+  /* 适配 iframe 高度 */
+  min-height: 100vh; 
+  background-color: transparent;
 }
 
 .captcha-box {
   background: #fff;
   border-radius: 8px;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  /* 阴影稍微调小一点，因为它在 iframe 里 */
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
   padding: 16px;
-  max-width: 400px;
-  width: 100%;
+  width: 320px; /* 固定宽度适合做插件 */
 }
 
 .header {
-  background: #4285f4;
+  background: #e91e63; /* 改成了波奇酱粉色风格，或者你可以改回 #4285f4 */
   color: white;
   padding: 16px;
   margin: -16px -16px 16px -16px;
@@ -166,15 +188,8 @@ onMounted(() => {
   text-align: left;
 }
 
-.header p {
-  margin: 0;
-  font-size: 14px;
-}
-
-.header h2 {
-  margin: 4px 0 0 0;
-  font-size: 24px;
-}
+.header p { margin: 0; font-size: 14px; }
+.header h2 { margin: 4px 0 0 0; font-size: 20px; }
 
 .grid {
   display: grid;
@@ -186,102 +201,42 @@ onMounted(() => {
 .grid-item {
   position: relative;
   cursor: pointer;
-  aspect-ratio: 1; /* 正方形 */
+  aspect-ratio: 1;
   overflow: hidden;
 }
 
-.grid-item img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
+.grid-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
 
 .overlay {
   position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  background: rgba(66, 133, 244, 0.3); /* Google Blue tint */
+  top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(233, 30, 99, 0.3);
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 4px solid #4285f4;
+  border: 4px solid #e91e63;
   box-sizing: border-box;
 }
 
 .checkmark {
-  background: #4285f4;
+  background: #e91e63;
   color: white;
   border-radius: 50%;
-  width: 24px;
-  height: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  width: 24px; height: 24px;
+  display: flex; align-items: center; justify-content: center;
   font-weight: bold;
-  position: absolute;
-  top: 4px;
-  left: 4px;
-  font-size: 14px;
+  position: absolute; top: 4px; left: 4px; font-size: 14px;
 }
 
-.actions {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-}
+.actions { display: flex; gap: 12px; }
 
-button {
-  border: none;
-  padding: 10px 20px;
-  border-radius: 4px;
-  cursor: pointer;
-  font-weight: bold;
-  transition: background 0.2s;
-}
+button { border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold; transition: background 0.2s; }
 
-.refresh-btn {
-  background: #f1f3f4;
-  color: #555;
-}
+.refresh-btn { background: #f1f3f4; color: #555; }
+.verify-btn { background: #e91e63; color: white; flex-grow: 1; }
+.verify-btn:disabled { background: #f8bbd0; cursor: not-allowed; }
 
-.refresh-btn:hover {
-  background: #e0e0e0;
-}
-
-.verify-btn {
-  background: #4285f4;
-  color: white;
-  flex-grow: 1;
-}
-
-.verify-btn:hover {
-  background: #3367d6;
-}
-
-.verify-btn:disabled {
-  background: #a0c3ff;
-  cursor: not-allowed;
-}
-
-.message {
-  margin-top: 12px;
-  padding: 8px;
-  border-radius: 4px;
-  text-align: center;
-  font-weight: bold;
-}
-
-.success {
-  background: #e6f4ea;
-  color: #137333;
-}
-
-.error {
-  background: #fce8e6;
-  color: #c5221f;
-}
+.message { margin-top: 12px; padding: 8px; border-radius: 4px; text-align: center; font-size: 14px; }
+.success { background: #e6f4ea; color: #137333; }
+.error { background: #fce8e6; color: #c5221f; }
 </style>
-
